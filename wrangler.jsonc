@@ -1,0 +1,21 @@
+{
+	"name": "news-app-backend",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-23",
+	"observability": {
+		"enabled": true,
+	},
+	// Daily pipeline at 7 AM America/New_York. Cron is UTC-only, so both EDT (11:00) and EST (12:00)
+	// are scheduled and the handler skips whichever one isn't 7 AM local.
+	"triggers": {
+		"crons": ["0 11 * * *", "0 12 * * *"],
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "news-db",
+			"database_id": "d866aa57-1658-4a89-9a98-1fc2a87b84c8",
+			"migrations_dir": "migrations",
+		},
+	],
+}
