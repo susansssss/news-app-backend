@@ -1,11 +1,14 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { AnthropicBedrockMantle } from '@anthropic-ai/bedrock-sdk';
+import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
+import { z } from 'zod';
+import { searchNews, searchPubMed, type FeedItem } from './sources';
 import { TOPICS, type Topic } from './topics';
 
-const MODEL = 'claude-opus-5-5';
+const MODEL = 'anthropic.claude-opus-5-5';
 const ARTICLES_PER_TOPIC = 5;
 const MAX_ARTICLES_PER_TOPIC_STORED = 20;
 const LOOKBACK_DAYS = 7;
-const MAX_PAUSE_RESUMES = 4;
+const MAX_CANDIDATES = 45;
 
 export interface CandidateArticle {
 	headline: string;
@@ -18,11 +21,13 @@ export interface CandidateArticle {
 
 export interface TopicResult {
 	topic: string;
+	candidates: number;
 	total_returned: number;
 	inserted: number;
 	skipped: number;
 	invalid: number;
 	removed_by_cap: number;
+	source_errors?: string[];
 	error?: string;
 }
 
@@ -36,46 +41,28 @@ export interface AgentResult {
 	topics: TopicResult[];
 }
 
-const SYSTEM_PROMPT = `You are a news research analyst. Use web search to find recent, significant news articles on the topic you are given, then report them as JSON.
+const Selection = z.object({
+	articles: z.array(
+		z.object({
+			candidate_id: z.number().int(),
+			summary: z.string(),
+			relevance_score: z.number().int(),
+		}),
+	),
+});
+
+const SYSTEM_PROMPT = `You are a news research analyst. You are given a numbered list of candidate articles gathered from news feeds and PubMed for one topic. Pick the most significant ones and summarise them.
 
 Rules:
-- Only include articles published within the date window you are given. Use the article's own publication date.
-- Every URL must be the direct URL of a specific article that appeared in your search results. Never invent or guess URLs, and never use a homepage or search page.
-- Prefer primary and reputable sources. Do not include two articles about the same event; pick the best one.
-- If fewer articles qualify than requested, return fewer. An empty array is acceptable.
-
-Your final message must be only a JSON array, with no prose or code fences. Each element has exactly these keys:
-- "headline": the article's headline
-- "source": the publication or organisation name (e.g. "Reuters", "Anthropic", "NEJM")
-- "published_date": publication date as "YYYY-MM-DD"
-- "url": the article URL
-- "summary": 2-3 sentences on what happened and why it matters
-- "relevance_score": integer 1-10 - how significant and on-topic the article is (10 = major, squarely on-topic development; 5 = moderately relevant; 1 = barely relevant)`;
+- Only pick candidates that are squarely on-topic per the topic description. Skip off-topic, promotional, opinion-only and low-quality items.
+- Do not pick two candidates about the same event or paper; pick the best source for it.
+- Rank by significance, preferring more recent items when significance is similar.
+- If fewer candidates qualify than requested, return fewer. An empty list is acceptable.
+- "summary": 2-3 sentences on what happened and why it matters, based only on the candidate's headline and snippet. Do not add facts that are not there.
+- "relevance_score": integer 1-10 - how significant and on-topic the article is (10 = major, squarely on-topic development; 5 = moderately relevant; 1 = barely relevant).`;
 
 function isoDate(d: Date): string {
 	return d.toISOString().slice(0, 10);
-}
-
-function userPrompt(topic: Topic, today: Date): string {
-	const from = new Date(today.getTime() - LOOKBACK_DAYS * 86_400_000);
-	return `Topic: ${topic.name}
-What counts as on-topic: ${topic.brief}
-
-Today is ${isoDate(today)}. Find the ${ARTICLES_PER_TOPIC} most recent and significant articles on this topic published between ${isoDate(from)} and ${isoDate(today)}, ordered from most to least significant.`;
-}
-
-/**
- * Pulls the JSON array out of Claude's reply. With web search the reply is split across
- * several text blocks (one per citation span), so the blocks are concatenated first.
- */
-export function extractJsonArray(text: string): unknown[] {
-	const cleaned = text.replace(/```(?:json)?/gi, '').trim();
-	const start = cleaned.indexOf('[');
-	const end = cleaned.lastIndexOf(']');
-	if (start === -1 || end < start) throw new Error('No JSON array found in Claude response');
-	const parsed: unknown = JSON.parse(cleaned.slice(start, end + 1));
-	if (!Array.isArray(parsed)) throw new Error('Claude response JSON is not an array');
-	return parsed;
 }
 
 /** Drops fragments and utm_* tracking params so the same article maps to one URL. */
@@ -94,85 +81,101 @@ export function normalizeUrl(raw: string): string | null {
 	return url.toString();
 }
 
-function normalizeDate(raw: unknown): string | null {
-	if (typeof raw !== 'string') return null;
-	const match = /^(\d{4}-\d{2}-\d{2})/.exec(raw.trim());
-	if (!match || Number.isNaN(Date.parse(match[1]))) return null;
-	return match[1];
-}
-
-function nonEmptyString(raw: unknown): string | null {
-	return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
-}
-
-/** Validates one element of Claude's array; returns null if it can't be stored. */
-export function toCandidate(raw: unknown): CandidateArticle | null {
-	if (typeof raw !== 'object' || raw === null) return null;
-	const item = raw as Record<string, unknown>;
-	const headline = nonEmptyString(item.headline);
-	const source = nonEmptyString(item.source);
-	const summary = nonEmptyString(item.summary);
-	const url = typeof item.url === 'string' ? normalizeUrl(item.url) : null;
-	const score = Number(item.relevance_score);
-	if (!headline || !source || !summary || !url || !Number.isFinite(score)) return null;
-	return {
-		headline,
-		source,
-		published_at: normalizeDate(item.published_date),
-		url,
-		summary,
-		relevance_score: Math.min(10, Math.max(1, Math.round(score))),
-	};
-}
-
-async function askClaude(client: Anthropic, topic: Topic, today: Date): Promise<unknown[]> {
-	const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: 'user', content: userPrompt(topic, today) }];
-
-	for (let attempt = 0; ; attempt++) {
-		const response = await client.beta.messages.create({
-			model: MODEL,
-			max_tokens: 16000,
-			thinking: { type: 'adaptive' },
-			output_config: { effort: 'medium' },
-			betas: ['server-side-fallback-2026-07-01'],
-			fallbacks: 'default',
-			system: SYSTEM_PROMPT,
-			tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 8 }],
-			messages,
-		});
-
-		// The server-side search loop hit its iteration limit; resend so it resumes where it stopped.
-		if (response.stop_reason === 'pause_turn' && attempt < MAX_PAUSE_RESUMES) {
-			messages.push({ role: 'assistant', content: response.content });
-			continue;
-		}
-		if (response.stop_reason === 'refusal') {
-			throw new Error(`Claude declined the request (${response.stop_details?.category ?? 'no category'})`);
-		}
-		if (response.stop_reason !== 'end_turn') {
-			throw new Error(`Claude stopped early (stop_reason: ${response.stop_reason})`);
-		}
-
-		const text = response.content
-			.filter((block): block is Anthropic.Beta.BetaTextBlock => block.type === 'text')
-			.map((block) => block.text)
-			.join('');
-		return extractJsonArray(text);
+/** Keeps items inside the lookback window, with valid URLs, deduplicated by URL and headline; newest first. */
+export function selectCandidates(items: FeedItem[], today: Date): FeedItem[] {
+	const from = isoDate(new Date(today.getTime() - LOOKBACK_DAYS * 86_400_000));
+	const to = isoDate(new Date(today.getTime() + 86_400_000));
+	const seenUrls = new Set<string>();
+	const seenHeadlines = new Set<string>();
+	const kept: FeedItem[] = [];
+	for (const item of items) {
+		const url = normalizeUrl(item.url);
+		const headlineKey = item.headline.toLowerCase().replace(/\W+/g, ' ').trim();
+		if (!url || !item.published_at || item.published_at < from || item.published_at > to) continue;
+		if (seenUrls.has(url) || seenHeadlines.has(headlineKey)) continue;
+		seenUrls.add(url);
+		seenHeadlines.add(headlineKey);
+		kept.push({ ...item, url });
 	}
+	return kept.sort((a, b) => b.published_at!.localeCompare(a.published_at!)).slice(0, MAX_CANDIDATES);
+}
+
+async function gatherItems(topic: Topic): Promise<{ items: FeedItem[]; errors: string[] }> {
+	const searches = topic.newsQueries.map((q) => searchNews(q));
+	if (topic.pubmedQuery) searches.push(searchPubMed(topic.pubmedQuery, LOOKBACK_DAYS));
+	const settled = await Promise.allSettled(searches);
+	const items = settled.flatMap((s) => (s.status === 'fulfilled' ? s.value : []));
+	const errors = settled.flatMap((s) => (s.status === 'rejected' ? [String(s.reason instanceof Error ? s.reason.message : s.reason)] : []));
+	return { items, errors };
+}
+
+function userPrompt(topic: Topic, candidates: FeedItem[], today: Date): string {
+	const list = candidates
+		.map((c, i) => `[${i}] ${c.headline}\nSource: ${c.source} | Date: ${c.published_at}\n${c.snippet || '(no snippet)'}`)
+		.join('\n\n');
+	return `Topic: ${topic.name}
+What counts as on-topic: ${topic.brief}
+
+Today is ${isoDate(today)}. From the candidates below, pick up to ${ARTICLES_PER_TOPIC} of the most recent and significant articles on this topic, ordered from most to least significant. Refer to each by its number as "candidate_id".
+
+Candidates:
+
+${list}`;
+}
+
+async function rankWithClaude(client: AnthropicBedrockMantle, topic: Topic, candidates: FeedItem[], today: Date) {
+	const response = await client.messages.parse({
+		model: MODEL,
+		max_tokens: 16000,
+		thinking: { type: 'adaptive' },
+		output_config: { effort: 'medium', format: zodOutputFormat(Selection) },
+		system: SYSTEM_PROMPT,
+		messages: [{ role: 'user', content: userPrompt(topic, candidates, today) }],
+	});
+	if (response.stop_reason === 'refusal') {
+		throw new Error(`Claude declined the request (${response.stop_details?.category ?? 'no category'})`);
+	}
+	if (response.stop_reason !== 'end_turn' || !response.parsed_output) {
+		throw new Error(`Claude returned no usable selection (stop_reason: ${response.stop_reason})`);
+	}
+	return response.parsed_output.articles;
+}
+
+/** Maps Claude's picks back onto the feed items; picks with unknown or repeated ids are dropped. */
+export function toArticles(picks: z.infer<typeof Selection>['articles'], candidates: FeedItem[]): CandidateArticle[] {
+	const used = new Set<number>();
+	const articles: CandidateArticle[] = [];
+	for (const pick of picks.slice(0, ARTICLES_PER_TOPIC)) {
+		const item = candidates[pick.candidate_id];
+		const summary = pick.summary.trim();
+		if (!item || used.has(pick.candidate_id) || !summary) continue;
+		used.add(pick.candidate_id);
+		articles.push({
+			headline: item.headline,
+			source: item.source,
+			published_at: item.published_at,
+			url: item.url,
+			summary,
+			relevance_score: Math.min(10, Math.max(1, Math.round(pick.relevance_score))),
+		});
+	}
+	return articles;
 }
 
 export async function storeArticles(db: D1Database, topic: Topic, articles: CandidateArticle[]) {
 	const insert = db.prepare(
 		`INSERT INTO articles (topic, headline, source, published_at, url, summary, relevance_score)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (url) DO NOTHING`,
+		 ON CONFLICT (url) DO NOTHING
+		 RETURNING id`,
 	);
 	const results = articles.length
 		? await db.batch(
 				articles.map((a) => insert.bind(topic.id, a.headline, a.source, a.published_at, a.url, a.summary, a.relevance_score)),
 			)
 		: [];
-	const inserted = results.reduce((n, r) => n + (r.meta.changes ?? 0), 0);
+	// Count RETURNING rows, not meta.changes: the search-index triggers inflate the change count.
+	const inserted = results.reduce((n, r) => n + r.results.length, 0);
 
 	// Keep the newest articles per topic; undated ones are ranked by when they were fetched.
 	const cap = await db
@@ -181,22 +184,29 @@ export async function storeArticles(db: D1Database, topic: Topic, articles: Cand
 			 WHERE topic = ?1 AND id NOT IN (
 				SELECT id FROM articles WHERE topic = ?1
 				ORDER BY COALESCE(published_at, substr(fetched_at, 1, 10)) DESC, id DESC
-				LIMIT ?2)`,
+				LIMIT ?2)
+			 RETURNING id`,
 		)
 		.bind(topic.id, MAX_ARTICLES_PER_TOPIC_STORED)
-		.run();
+		.all();
 
-	return { inserted, skipped: articles.length - inserted, removed_by_cap: cap.meta.changes ?? 0 };
+	return { inserted, skipped: articles.length - inserted, removed_by_cap: cap.results.length };
 }
 
-async function runTopic(client: Anthropic, db: D1Database, topic: Topic, today: Date): Promise<TopicResult> {
-	const result: TopicResult = { topic: topic.id, total_returned: 0, inserted: 0, skipped: 0, invalid: 0, removed_by_cap: 0 };
+async function runTopic(client: AnthropicBedrockMantle, db: D1Database, topic: Topic, today: Date): Promise<TopicResult> {
+	const result: TopicResult = { topic: topic.id, candidates: 0, total_returned: 0, inserted: 0, skipped: 0, invalid: 0, removed_by_cap: 0 };
 	try {
-		const raw = await askClaude(client, topic, today);
-		result.total_returned = raw.length;
-		const candidates = raw.map(toCandidate).filter((a): a is CandidateArticle => a !== null);
-		result.invalid = raw.length - candidates.length;
-		Object.assign(result, await storeArticles(db, topic, candidates));
+		const { items, errors } = await gatherItems(topic);
+		if (errors.length) result.source_errors = errors;
+		const candidates = selectCandidates(items, today);
+		result.candidates = candidates.length;
+		if (!candidates.length) throw new Error('No candidate articles found in the past 7 days');
+
+		const picks = await rankWithClaude(client, topic, candidates, today);
+		result.total_returned = picks.length;
+		const articles = toArticles(picks, candidates);
+		result.invalid = Math.min(picks.length, ARTICLES_PER_TOPIC) - articles.length;
+		Object.assign(result, await storeArticles(db, topic, articles));
 	} catch (err) {
 		result.error = err instanceof Error ? err.message : String(err);
 		console.error(`agent: topic ${topic.id} failed`, err);
@@ -206,7 +216,7 @@ async function runTopic(client: Anthropic, db: D1Database, topic: Topic, today: 
 
 export async function runAgent(env: Env): Promise<AgentResult> {
 	const started = Date.now();
-	const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+	const client = new AnthropicBedrockMantle({ awsRegion: env.AWS_REGION, apiKey: env.BEDROCK_API_KEY });
 	const today = new Date();
 	const topics = await Promise.all(TOPICS.map((topic) => runTopic(client, env.DB, topic, today)));
 

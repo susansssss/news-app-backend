@@ -1,0 +1,7 @@
+// Cloudflare Pages project for the dashboard (static files only). Deploy from this folder: `npx wrangler pages deploy`.
+// Refresh calls the Worker's /agent directly with the password the owner enters in the browser.
+{
+	"name": "news-intel-dashboard",
+	"pages_build_output_dir": "./public",
+	"compatibility_date": "2026-10-23",
+}

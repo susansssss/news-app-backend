@@ -2,9 +2,18 @@
 	"name": "news-app-backend",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-10-23",
+	// The Bedrock SDK's AWS auth code imports Node built-ins.
+	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
 		"enabled": true,
 	},
+	// Claude runs on Amazon Bedrock; BEDROCK_API_KEY is a Worker secret.
+	"vars": {
+		"AWS_REGION": "us-east-1",
+	},
+	// Public at news-app-backend.<subdomain>.workers.dev; per-version preview URLs aren't needed.
+	"workers_dev": true,
+	"preview_urls": false,
 	// Daily pipeline at 7 AM America/New_York. Cron is UTC-only, so both EDT (11:00) and EST (12:00)
 	// are scheduled and the handler skips whichever one isn't 7 AM local.
 	"triggers": {
